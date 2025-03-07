@@ -160,7 +160,6 @@ class TDSConvCTCModule(pl.LightningModule):
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
 
-            """ Maybe add a Conv or pool layer here to reduce the number of features"""
             # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
             # (T, N, bands=2, mlp_features[-1])
