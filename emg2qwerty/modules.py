@@ -306,3 +306,57 @@ class TDSlstmEncoder(nn.Module):
         x = self.out_layer(x)
         # print("Shape after TBDLSTMEncoder", x.shape)
         return x
+
+class TDSparallelConvLstmEncoder(nn.Module):
+    def __init__(
+        self,
+        num_features: int,
+        conv_block: nn.Module,
+        lstm_hidden_size: int = 128,
+        num_lstm_layers: int = 4,
+        merge_method: str = "concat"  # Options: "concat", "add"
+    ) -> None:
+        super().__init__()
+        
+        self.merge_method = merge_method
+        
+        # Convolutional branch (expects input shape: (T, N, num_features))
+        self.conv_branch = conv_block
+        
+        # LSTM branch (expects input shape: (T, N, num_features))
+        self.lstm_branch = nn.LSTM(
+            input_size=num_features,
+            hidden_size=lstm_hidden_size,
+            num_layers=num_lstm_layers,
+            batch_first=False,
+            bidirectional=True
+        )
+        
+        # Fully connected block for the LSTM branch output (if needed)
+        self.lstm_fc = nn.Linear(lstm_hidden_size * 2, num_features)
+        
+        # Merge layers: adjust output dimensions if concatenation is used.
+        if merge_method == "concat":
+            # After concatenation, you may want to project back to the original dimension.
+            self.merge_fc = nn.Linear(num_features * 2, num_features)
+        elif merge_method == "add":
+            # Ensure the dimensions match for element-wise addition.
+            # This might require both branches to output tensors of the same shape.
+            pass
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # Process input through the convolutional branch
+        conv_out = self.conv_branch(inputs)  # Expected shape: (T, N, num_features)
+        
+        # Process input through the LSTM branch
+        lstm_out, _ = self.lstm_branch(inputs)  # (T, N, 2 * lstm_hidden_size)
+        lstm_out = self.lstm_fc(lstm_out)         # Project back to (T, N, num_features)
+        
+        # Merge the outputs
+        if self.merge_method == "concat":
+            merged = torch.cat((conv_out, lstm_out), dim=-1)  # Shape: (T, N, num_features * 2)
+            merged = self.merge_fc(merged)                     # Project back to (T, N, num_features)
+        elif self.merge_method == "add":
+            merged = conv_out + lstm_out  # Element-wise addition
+            
+        return merged
