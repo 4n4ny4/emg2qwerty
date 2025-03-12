@@ -169,7 +169,7 @@ class LogSpectrogram:
     """
 
     n_fft: int = 64
-    hop_length: int = 16
+    hop_length: int = 80
 
     def __post_init__(self) -> None:
         self.spectrogram = torchaudio.transforms.Spectrogram(
