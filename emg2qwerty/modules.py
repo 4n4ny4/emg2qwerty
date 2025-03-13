@@ -304,7 +304,6 @@ class TDSlstmEncoder(nn.Module):
         x, _ = self.lstm_layer(inputs)  # (T, N, 2 * lstm_hidden_size)
         x = self.fc_block(x) # Apply FC transformation
         x = self.out_layer(x)
-        # print("Shape after TBDLSTMEncoder", x.shape)
         return x
 
 class TDSparallelConvLstmEncoder(nn.Module):
@@ -332,16 +331,15 @@ class TDSparallelConvLstmEncoder(nn.Module):
             bidirectional=True
         )
         
-        # Fully connected block for the LSTM branch output (if needed)
+        # Fully connected block for the LSTM branch output
         self.lstm_fc = nn.Linear(lstm_hidden_size * 2, num_features)
         
         # Merge layers: adjust output dimensions if concatenation is used.
         if merge_method == "concat":
-            # After concatenation, you may want to project back to the original dimension.
+            # After concatenation, project back to the original dimension.
             self.merge_fc = nn.Linear(num_features * 2, num_features)
         elif merge_method == "add":
             # Ensure the dimensions match for element-wise addition.
-            # This might require both branches to output tensors of the same shape.
             pass
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
