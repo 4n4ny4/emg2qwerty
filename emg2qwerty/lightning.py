@@ -271,6 +271,267 @@ class TDSConvCTCModule(pl.LightningModule):
             self.parameters(),
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
+        ) 
+class GRUCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+            self,
+            in_features: int,
+            mlp_features: Sequence[int],
+            gru_hidden_size: int,
+            gru_num_layers: int,
+            optimizer: DictConfig,
+            lr_scheduler: DictConfig,
+            decoder: DictConfig,
+        ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        # 1. Normalize the spectrogram input.
+        self.spectrogram_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        # 2. Process each band with a rotation-invariant MLP.
+        self.mlp = MultiBandRotationInvariantMLP(
+            in_features=in_features, mlp_features=mlp_features
+        )
+        # After the MLP, the output shape is (T, N, num_bands, mlp_features[-1]).
+        # Flatten bands to get (T, N, num_bands * mlp_features[-1])
+        gru_input_size = self.NUM_BANDS * mlp_features[-1]
+        self.gru = nn.GRU(
+                input_size=gru_input_size,
+                hidden_size=gru_hidden_size,
+                num_layers=gru_num_layers,
+                bidirectional=True,
+                batch_first=False,
+                dropout=0.3 if gru_num_layers > 1 else 0.0,
+            )
+        # Dropout after GRU output.
+        self.dropout_gru = nn.Dropout(0.3)
+        # 4. A linear layer to map GRU outputs to the number of classes.
+        self.fc = nn.Linear(2 * gru_hidden_size, charset().num_classes)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+
+        # CTC loss using the null class from the charset.
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        # Decoder is instantiated via Hydra.
+        self.decoder = instantiate(decoder)
+
+        # Metrics for train, validation, and test (using Character Error Rates).
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict({
+            f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+            for phase in ["train", "val", "test"]
+        })
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, num_bands, electrode_channels, freq)
+        x = self.spectrogram_norm(inputs)
+        x = self.mlp(x)  # -> (T, N, num_bands, mlp_features[-1])
+        x = x.flatten(start_dim=2)  # -> (T, N, num_bands * mlp_features[-1])
+        x = self.dropout_mlp(x)      # Apply dropout after MLP
+        x, _ = self.gru(x)           # -> (T, N, 2 * gru_hidden_size)
+        x = self.dropout_gru(x)      # Apply dropout after GRU
+        x = self.fc(x)               # -> (T, N, num_classes)
+        return self.log_softmax(x)
+
+    def _step(self, phase: str, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions = self.forward(inputs)
+        # Assuming GRU preserves the time dimension.
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        # Decode emissions.
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics.
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets_np = targets.detach().cpu().numpy()
+        target_lengths_np = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            from emg2qwerty.data import LabelData
+            target = LabelData.from_labels(targets_np[: target_lengths_np[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("train", batch)
+
+    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("val", batch)
+
+    def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("test", batch)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+class GRUCTCModuleNoDropout(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        gru_hidden_size: int,
+        gru_num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        # 1. Normalize the spectrogram input.
+        self.spectrogram_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        # 2. Process each band with a rotation-invariant MLP.
+        self.mlp = MultiBandRotationInvariantMLP(
+            in_features=in_features, mlp_features=mlp_features
+        )
+        # After the MLP, the output shape is (T, N, num_bands, mlp_features[-1]).
+        # Flatten bands to get (T, N, num_bands * mlp_features[-1])
+        gru_input_size = self.NUM_BANDS * mlp_features[-1]
+        # 3. Use a bidirectional GRU to model temporal dependencies.
+        self.gru = nn.GRU(
+            input_size=gru_input_size,
+            hidden_size=gru_hidden_size,
+            num_layers=gru_num_layers,
+            bidirectional=True,
+            batch_first=False,
+        )
+        # 4. A linear layer to map GRU outputs to the number of classes.
+        self.fc = nn.Linear(2 * gru_hidden_size, charset().num_classes)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
+
+        # CTC loss
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        # Decoder is instantiated via Hydra.
+        self.decoder = instantiate(decoder)
+
+        # Metrics for train/val/test (using Character Error Rates).
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict({
+            f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+            for phase in ["train", "val", "test"]
+        })
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs shape: (T, N, num_bands, electrode_channels, freq)
+        x = self.spectrogram_norm(inputs)
+        x = self.mlp(x)  # -> (T, N, num_bands, mlp_features[-1])
+        x = x.flatten(start_dim=2)  # -> (T, N, num_bands * mlp_features[-1])
+        x, _ = self.gru(x)          # -> (T, N, 2 * gru_hidden_size)
+        x = self.fc(x)              # -> (T, N, num_classes)
+        return self.log_softmax(x)
+
+    def _step(self, phase: str, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions = self.forward(inputs)
+        # Assume GRU preserves the time dimension.
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        # Decode emissions.
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics.
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets_np = targets.detach().cpu().numpy()
+        target_lengths_np = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            from emg2qwerty.data import LabelData
+            target = LabelData.from_labels(targets_np[: target_lengths_np[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("train", batch)
+
+    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("val", batch)
+
+    def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        return self._step("test", batch)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
         )
 
 class TDSlstmCTCModule(pl.LightningModule):
