@@ -18,7 +18,7 @@ rects1 = ax.bar(x - width/2, val_CER, width, label='Validation CER')
 rects2 = ax.bar(x + width/2, test_CER, width, label='Test CER')
 
 # Add labels and title:
-ax.set_ylabel('CER (%)')
+ax.set_ylabel('CER')
 ax.set_title('CER for Different Sampling Rates and Kernel Widths')
 ax.set_xticks(x)
 ax.set_xticklabels(labels)
