@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 import numpy as np
 import torch
 import torchaudio
-
+import scipy
 
 TTransformIn = TypeVar("TTransformIn")
 TTransformOut = TypeVar("TTransformOut")
@@ -169,7 +169,7 @@ class LogSpectrogram:
     """
 
     n_fft: int = 64
-    hop_length: int = 80
+    hop_length: int = 16
 
     def __post_init__(self) -> None:
         self.spectrogram = torchaudio.transforms.Spectrogram(
@@ -243,3 +243,86 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+@dataclass
+class AddGaussianNoise:
+    """Adds Gaussian noise to the EMG signal."""
+    noise_level: float = 0.0075  # Standard deviation of noise relative to signal std
+    
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        std = torch.std(tensor)
+        noise = torch.randn_like(tensor) * std * self.noise_level
+        return tensor + noise
+
+@dataclass
+class RandomAmplitudeScaling:
+    """Randomly scales the amplitude of the EMG signal."""
+    min_scale: float = 0.85
+    max_scale: float = 1.15
+    
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        scale = np.random.uniform(self.min_scale, self.max_scale)
+        return tensor * scale
+
+@dataclass
+class ReverseSignal:
+    """Reverses the EMG signal along the time dimension.
+    
+    This augmentation flips the signal in time, which can help the model 
+    become more robust to potential biases in signal direction.
+    
+    Args:
+        time_dim (int): Dimension along which to reverse the signal. (default: 0)
+        probability (float): Probability of applying the reversal. (default: 0.5)
+    """
+    time_dim: int = 0  # Typically the first dimension is time
+    probability: float = 0.5
+    
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.probability:
+            return torch.flip(tensor, [self.time_dim])
+        return tensor
+
+@dataclass
+class NotchFilter:
+    """Applies a notch filter to remove specific frequency components from the EMG signal.
+    
+    This is particularly useful for removing power line interference (60Hz in the US).
+    
+    Args:
+        notch_freq (float): Center frequency to filter out in Hz. (default: 60.0)
+        quality_factor (float): Quality factor of the notch filter. Higher values create
+            a narrower notch. (default: 30.0)
+        sampling_rate (float): Sampling rate of the EMG signal in Hz. (default: 2000.0)
+    """
+    notch_freq: float = 60.0  # Hz
+    quality_factor: float = 30.0  # Higher Q means narrower notch
+    sampling_rate: float = 2000.0  # Hz
+    
+    def __post_init__(self) -> None:
+        # Pre-compute filter coefficients
+        nyquist = self.sampling_rate / 2
+        normalized_freq = self.notch_freq / nyquist
+        
+        # Create notch filter coefficients
+        self.b, self.a = scipy.signal.iirnotch(
+            normalized_freq, 
+            self.quality_factor, 
+            fs=self.sampling_rate/nyquist
+        )
+    
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        # Apply filter along time dimension
+        tensor_np = tensor.cpu().numpy()
+        
+        # Apply filter along first dimension (time)
+        # Handle multi-dimensional tensors
+        original_shape = tensor_np.shape
+        tensor_np = tensor_np.reshape(original_shape[0], -1)
+        filtered_np = scipy.signal.filtfilt(self.b, self.a, tensor_np, axis=0)
+        filtered_np = filtered_np.reshape(original_shape)
+        
+        # Make array contiguous before conversion to tensor
+        filtered_np = np.ascontiguousarray(filtered_np)
+        
+        return torch.from_numpy(filtered_np).to(tensor.device, tensor.dtype)
